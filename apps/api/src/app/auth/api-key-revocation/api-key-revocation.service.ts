@@ -7,10 +7,12 @@ import { addNewRelicApiKeyRevocationAttributes } from '../services/passport/newr
 import {
   ApiKeyRevocationModeEnum,
   ApiKeyRevocationPolicy,
+  canSignWithApiKey,
   evaluateApiKeyRequest,
   getApiKeyCreatedAt,
   getRevokedApiKeyMessage,
   hashApiKeyFromHeader,
+  normalizeRoutePath,
   parseApiKeyRevocationPolicy,
   requiresRotation,
 } from './api-key-revocation.policy';
@@ -29,6 +31,14 @@ const keyCreatedAtCache = new LRUCache<string, { createdAt: Date | null }>({ max
  * once it passes, and keeps a bad value from being logged on every call.
  */
 const parsedPolicyCache = new LRUCache<string, ApiKeyRevocationPolicy>({ max: 100, ttl: 60 * 1000 });
+
+/*
+ * Calls made with a key created before the cutoff that were logged in the last ten minutes, by key, route and outcome.
+ * At first nearly every key is that old, so a line per call would log most of the API's traffic. One line per ten
+ * minutes and instance still shows which environments use such a key and where; the New Relic transaction attributes
+ * keep the exact counts.
+ */
+const loggedOldKeyCalls = new LRUCache<string, true>({ max: 50_000, ttl: 10 * 60 * 1000 });
 
 type RevocationRequest = {
   organizationId: string;
@@ -76,6 +86,27 @@ export class ApiKeyRevocationService {
     return requiresRotation(policy, getApiKeyCreatedAt((apiKey as StoredApiKey)._id));
   }
 
+  /**
+   * The environment's stored (encrypted) keys whose subscriber and context hashes still count. In `block_all` a key
+   * created before the cutoff is left out, so a leaked key can no longer open an Inbox or update a subscriber
+   * through it.
+   */
+  async getSigningKeys({
+    organizationId,
+    environmentId,
+    apiKeys,
+  }: {
+    organizationId: string;
+    environmentId: string;
+    apiKeys: IApiKey[];
+  }): Promise<string[]> {
+    const policy = await this.getPolicy({ organizationId, environmentId });
+
+    return apiKeys
+      .filter((apiKey) => canSignWithApiKey(policy, getApiKeyCreatedAt((apiKey as StoredApiKey)._id)))
+      .map((apiKey) => apiKey.key);
+  }
+
   /** Throws when the policy revokes the key the request was authenticated with, for this route. */
   async assertRequestAllowed({
     organizationId,
@@ -99,6 +130,15 @@ export class ApiKeyRevocationService {
     }
 
     addNewRelicApiKeyRevocationAttributes({ blocked: evaluation.blocked });
+    this.logOldKeyCall({
+      organizationId,
+      environmentId,
+      apiKeyHash,
+      method,
+      routePath,
+      mode: policy.mode,
+      blocked: evaluation.blocked,
+    });
 
     if (evaluation.blocked) {
       throw new UnauthorizedException(getRevokedApiKeyMessage(policy));
@@ -130,6 +170,43 @@ export class ApiKeyRevocationService {
     keyCreatedAtCache.set(apiKeyHash, { createdAt });
 
     return createdAt;
+  }
+
+  /** Logs the flags the New Relic transaction gets, once per key, route and outcome in ten minutes. */
+  private logOldKeyCall({
+    organizationId,
+    environmentId,
+    apiKeyHash,
+    method,
+    routePath,
+    mode,
+    blocked,
+  }: Omit<RevocationRequest, 'authorization'> & {
+    apiKeyHash: string | null;
+    mode: ApiKeyRevocationModeEnum;
+    blocked: boolean;
+  }): void {
+    const route = `${method.toUpperCase()} ${normalizeRoutePath(routePath)}`;
+    const loggedCallKey = `${apiKeyHash} ${route} ${blocked}`;
+
+    if (loggedOldKeyCalls.has(loggedCallKey)) {
+      return;
+    }
+
+    loggedOldKeyCalls.set(loggedCallKey, true);
+    this.logger.warn(
+      {
+        apiKeyRequiresRotation: true,
+        apiKeyRevocationBlocked: blocked,
+        apiKeyRevocationMode: mode,
+        organizationId,
+        environmentId,
+        route,
+      },
+      blocked
+        ? 'Rejected a call made with a revoked secret key'
+        : 'Allowed a call made with a secret key that has to be replaced'
+    );
   }
 
   private toPolicy(raw: unknown): ApiKeyRevocationPolicy {

@@ -39,7 +39,7 @@ function setup(flagValue: unknown, storedKeys: StoredKey[]) {
       return storedKeys.some((stored) => stored.hash === hash) ? { apiKeys: storedKeys } : null;
     }),
   };
-  const logger = { setContext: sinon.stub(), error: sinon.stub() };
+  const logger = { setContext: sinon.stub(), error: sinon.stub(), warn: sinon.stub() };
   const service = new ApiKeyRevocationService(
     featureFlagsService as never,
     environmentRepository as never,
@@ -129,11 +129,38 @@ describe('ApiKeyRevocationService', () => {
     expect((error as UnauthorizedException).message).to.equal(REVOKED_API_KEY_MESSAGE);
   });
 
-  it('never limits a key created after the cutoff', async () => {
+  it('never limits or logs a key created after the cutoff', async () => {
     const { apiKey, stored } = createNewKey();
-    const { service } = setup(flag('block_all'), [stored]);
+    const { service, logger } = setup(flag('block_all'), [stored]);
 
     await service.assertRequestAllowed(callWith(apiKey, 'GET', '/v1/subscribers'));
+
+    expect(logger.warn.called).to.equal(false);
+  });
+
+  it('logs a call made with an old key once per route and outcome, with the New Relic flags', async () => {
+    const { apiKey, stored } = createOldKey();
+    const { service, logger } = setup(flag('block_except_allowed'), [stored]);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await rejectionOf(service.assertRequestAllowed(callWith(apiKey, 'GET', '/v1/subscribers')));
+      await service.assertRequestAllowed(callWith(apiKey, 'POST', '/v1/events/trigger'));
+    }
+
+    expect(logger.warn.callCount).to.equal(2);
+    expect(logger.warn.firstCall.args[0]).to.deep.equal({
+      apiKeyRequiresRotation: true,
+      apiKeyRevocationBlocked: true,
+      apiKeyRevocationMode: 'block_except_allowed',
+      organizationId: 'org-id',
+      environmentId: 'env-id',
+      route: 'GET /v1/subscribers',
+    });
+    expect(logger.warn.secondCall.args[0]).to.deep.include({
+      apiKeyRequiresRotation: true,
+      apiKeyRevocationBlocked: false,
+      route: 'POST /v1/events/trigger',
+    });
   });
 
   it('lets an old key through in warn mode', async () => {
@@ -197,6 +224,50 @@ describe('ApiKeyRevocationService', () => {
       expect(service.isRotationRequired(policy, oldStored)).to.equal(true);
       expect(service.isRotationRequired(policy, newStored)).to.equal(false);
       expect(service.isRotationRequired(off, oldStored)).to.equal(false);
+    });
+  });
+
+  describe('getSigningKeys', () => {
+    const createKeys = () => [
+      { ...createOldKey().stored, key: 'old-encrypted-key' },
+      { ...createNewKey().stored, key: 'new-encrypted-key' },
+    ];
+
+    it('leaves out the keys created before the cutoff in block_all mode', async () => {
+      const { service } = setup(flag('block_all'), []);
+
+      const signingKeys = await service.getSigningKeys({
+        organizationId: 'org-id',
+        environmentId: 'env-id',
+        apiKeys: createKeys(),
+      });
+
+      expect(signingKeys).to.deep.equal(['new-encrypted-key']);
+    });
+
+    it('keeps every key in the other modes', async () => {
+      for (const flagValue of ['', flag('warn'), flag('block_except_allowed')]) {
+        const { service } = setup(flagValue, []);
+
+        const signingKeys = await service.getSigningKeys({
+          organizationId: 'org-id',
+          environmentId: 'env-id',
+          apiKeys: createKeys(),
+        });
+
+        expect(signingKeys, JSON.stringify(flagValue)).to.deep.equal(['old-encrypted-key', 'new-encrypted-key']);
+      }
+    });
+
+    it('reads the flag for the organization and environment of the keys', async () => {
+      const { service, featureFlagsService } = setup(flag('block_all'), []);
+
+      await service.getSigningKeys({ organizationId: 'org-id', environmentId: 'env-id', apiKeys: [] });
+
+      expect(featureFlagsService.getFlag.firstCall.args[0]).to.deep.include({
+        organization: { _id: 'org-id' },
+        environment: { _id: 'env-id' },
+      });
     });
   });
 });

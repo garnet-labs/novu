@@ -8,7 +8,7 @@ name: Garnet Runtime Visibility
 
 on:
   push:
-    branches: ["next","prod"]
+    branches: ['next']
   pull_request:
 
 permissions: {}
