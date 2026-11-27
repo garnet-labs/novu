@@ -1,0 +1,33 @@
+name: Linux validation
+
+on:
+  push:
+    branches: [ci-linux-validation]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          persist-credentials: false
+      - uses: "garnet-org/action@v2.6.0"
+      - uses: "pnpm/action-setup@v4"
+      - uses: "actions/setup-node@v7"
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: "Install dependencies"
+        run: |
+          pnpm --filter @novu/js... install --frozen-lockfile
+      - name: "Build prerequisites"
+        run: |
+          pnpm --filter @novu/agent-event-protocol build
+      - name: "Run checks"
+        run: |
+          pnpm --filter @novu/js test src/web-chat/apply-envelope.test.ts src/web-chat/validate-envelope.test.ts
